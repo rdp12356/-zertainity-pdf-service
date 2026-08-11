@@ -1,6 +1,7 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
 const cors = require('cors');
+const { PDFDocument } = require('pdf-lib');
 
 const app = express();
 app.use(cors());
@@ -33,13 +34,29 @@ app.post('/generate-pdf', async (req, res) => {
     await page.setContent(html, { waitUntil: 'networkidle0' });
 
     // Generate the PDF using the Skia engine
-    const pdfBuffer = await page.pdf({
+    const rawPdfBuffer = await page.pdf({
       format: 'A4',
       printBackground: true,
       margin: { top: '1.5cm', right: '1.5cm', bottom: '1.5cm', left: '1.5cm' }
     });
 
     await browser.close();
+
+    // Post-process with pdf-lib to add metadata and update to PDF v1.7
+    const pdfDoc = await PDFDocument.load(rawPdfBuffer);
+    
+    // The HTML payload could potentially pass title/subject, but we set robust defaults
+    const title = html.includes('Subject Aptitude Report') ? 'Subject Aptitude Report - Zertainity' : 'Zertainity Report';
+    
+    pdfDoc.setTitle(title);
+    pdfDoc.setAuthor('Zertainity');
+    pdfDoc.setSubject('Cognitive Profile & Career Assessment');
+    pdfDoc.setKeywords(['Zertainity', 'Career', 'Assessment', 'Aptitude', 'Student', 'Report', 'Education']);
+    pdfDoc.setProducer('Zertainity PDF Engine');
+    pdfDoc.setCreator('Zertainity Assessment Engine');
+    
+    const finalPdfBytes = await pdfDoc.save();
+    const pdfBuffer = Buffer.from(finalPdfBytes);
 
     // Send the PDF buffer directly back to the client/Edge Function
     res.setHeader('Content-Type', 'application/pdf');
