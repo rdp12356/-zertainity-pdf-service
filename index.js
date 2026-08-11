@@ -16,14 +16,15 @@ app.post('/generate-pdf', async (req, res) => {
   let browser;
   try {
     // Launch headless Chromium
-    // The arguments below are required to run securely inside Docker/Render
     browser = await puppeteer.launch({
-      headless: 'new',
+      headless: true, // updated from 'new' to true for modern Puppeteer
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu'
+        '--disable-gpu',
+        '--single-process' // helps with memory on Render free tier
       ]
     });
 
@@ -49,7 +50,7 @@ app.post('/generate-pdf', async (req, res) => {
   } catch (error) {
     console.error('PDF generation failed:', error);
     if (browser) await browser.close();
-    res.status(500).json({ error: 'Failed to generate PDF' });
+    res.status(500).json({ error: 'Failed to generate PDF', details: error.message, stack: error.stack });
   }
 });
 
