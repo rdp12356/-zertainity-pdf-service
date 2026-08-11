@@ -4,8 +4,7 @@ FROM ghcr.io/puppeteer/puppeteer:latest
 USER root
 
 # Define environment variables
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
 WORKDIR /usr/src/app
 
