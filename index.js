@@ -1,76 +1,104 @@
+'use strict';
+
+// Dedicated trusted upstream-only PDF renderer. Never expose HTML rendering without
+// a strong shared secret set in Render AND in the Supabase Edge Function secrets.
+const crypto = require('node:crypto');
 const express = require('express');
 const puppeteer = require('puppeteer');
-const cors = require('cors');
 const { PDFDocument } = require('pdf-lib');
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '10mb' })); // Allow large HTML payloads
+app.disable('x-powered-by');
+app.use(express.json({ limit: '400kb', strict: true }));
+const MAX_HTML = 300_000;
+const MAX_OUTPUT = 9_000_000;
+const PDF_TIMEOUT_MS = 20_000;
+let activeJobs = 0;
+
+function authorized(req) {
+  const secret = process.env.PDF_SERVICE_SECRET;
+  if (typeof secret !== 'string' || secret.length < 32) return false;
+  const supplied = req.get('x-pdf-secret') || '';
+  if (!supplied || Buffer.byteLength(supplied) !== Buffer.byteLength(secret)) return false;
+  return crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(secret));
+}
+function safeFilename(name) {
+  const basename = typeof name === 'string' ? name.replace(/[^A-Za-z0-9 ._()-]/g, '').replace(/^\.+/, '').trim().slice(0, 80) : '';
+  return (basename || 'zertainity-results').replace(/\.pdf$/i, '') + '.pdf';
+}
+app.get('/', (_req, res) => res.json({ service: 'Zertainity PDF service', status: 'available' }));
 
 app.post('/generate-pdf', async (req, res) => {
-  const { html, filename } = req.body;
-
-  if (!html) {
-    return res.status(400).json({ error: 'HTML content is required' });
+  // Fail CLOSED, rather than falling back to an unauthenticated rendering API.
+  if (!process.env.PDF_SERVICE_SECRET || process.env.PDF_SERVICE_SECRET.length < 32) {
+    return res.status(503).json({ error: 'PDF renderer not configured' });
   }
+  if (!authorized(req)) return res.status(403).json({ error: 'Forbidden' });
+  const html = req.body?.html;
+  if (typeof html !== 'string' || !html.trim()) return res.status(400).json({ error: 'HTML required' });
+  if (html.length > MAX_HTML) return res.status(413).json({ error: 'PDF request too large' });
+  if (activeJobs >= 2) return res.status(503).json({ error: 'Renderer busy, retry later' });
+  activeJobs += 1;
 
   let browser;
+  let timer;
   try {
-    // Launch headless Chromium
     browser = await puppeteer.launch({
-      headless: true, // updated from 'new' to true for modern Puppeteer
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--single-process' // helps with memory on Render free tier
-      ]
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+        '--disable-background-networking', '--disable-default-apps', '--disable-extensions',
+        '--disable-sync', '--no-first-run'],
     });
-
     const page = await browser.newPage();
-    
-    // Load the HTML content
-    await page.setContent(html, { waitUntil: 'networkidle0' });
-
-    // Generate the PDF using the Skia engine
-    const rawPdfBuffer = await page.pdf({
-      format: 'A4',
-      printBackground: true,
-      margin: { top: '1.5cm', right: '1.5cm', bottom: '1.5cm', left: '1.5cm' }
+    await page.setJavaScriptEnabled(false);
+    await page.setRequestInterception(true);
+    page.on('request', (request) => {
+      // Only embedded data URIs allowed. Block HTTP(S), file://, localhost
+      // and cloud metadata access even if untrusted HTML contains resource URLs.
+      if (request.url().startsWith('data:')) request.continue();
+      else request.abort('blockedbyclient');
     });
-
-    await browser.close();
-
-    // Post-process with pdf-lib to add metadata and update to PDF v1.7
-    const pdfDoc = await PDFDocument.load(rawPdfBuffer);
-    
-    // The HTML payload could potentially pass title/subject, but we set robust defaults
-    const title = html.includes('Subject Aptitude Report') ? 'Subject Aptitude Report - Zertainity' : 'Zertainity Report';
-    
-    pdfDoc.setTitle(title);
-    pdfDoc.setAuthor('Zertainity');
-    pdfDoc.setSubject('Cognitive Profile & Career Assessment');
-    pdfDoc.setKeywords(['Zertainity', 'Career', 'Assessment', 'Aptitude', 'Student', 'Report', 'Education']);
-    pdfDoc.setProducer('Zertainity PDF Engine');
-    pdfDoc.setCreator('Zertainity Assessment Engine');
-    
-    const finalPdfBytes = await pdfDoc.save();
-    const pdfBuffer = Buffer.from(finalPdfBytes);
-
-    // Send the PDF buffer directly back to the client/Edge Function
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename || 'report.pdf'}"`);
-    res.send(pdfBuffer);
-
+    const work = async () => {
+      await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 10_000 });
+      const raw = await page.pdf({
+        format: 'A4', printBackground: true,
+        margin: { top: '1.5cm', right: '1.5cm', bottom: '1.5cm', left: '1.5cm' },
+      });
+      if (raw.length > MAX_OUTPUT) throw new Error('output limit exceeded');
+      const doc = await PDFDocument.load(raw);
+      doc.setTitle('Zertainity Career Assessment');
+      doc.setAuthor('Zertainity');
+      doc.setSubject('Career guidance report');
+      const bytes = await doc.save();
+      if (bytes.length > MAX_OUTPUT) throw new Error('output limit exceeded');
+      return Buffer.from(bytes);
+    };
+    const timeout = new Promise((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('render timeout')), PDF_TIMEOUT_MS);
+    });
+    const pdf = await Promise.race([work(), timeout]);
+    res.set('Content-Type', 'application/pdf');
+    res.set('Content-Disposition', 'attachment; filename="' + safeFilename(req.body?.filename) + '"');
+    res.set('Cache-Control', 'no-store');
+    res.send(pdf);
   } catch (error) {
-    console.error('PDF generation failed:', error);
-    if (browser) await browser.close();
-    res.status(500).json({ error: 'Failed to generate PDF', details: error.message, stack: error.stack });
+    // Do not return user HTML, stack traces, file paths or engine details.
+    console.error('PDF request failed:', error?.name || 'Error');
+    res.status(502).json({ error: 'PDF render failed' });
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (browser) await browser.close().catch(() => {});
+    activeJobs -= 1;
   }
 });
 
-const PORT = process.env.PORT || 8001;
-app.listen(PORT, () => {
-  console.log(`PDF Microservice running on port ${PORT}`);
+app.use((error, _req, res, _next) => {
+  if (error.type === 'entity.too.large') return res.status(413).json({ error: 'PDF request too large' });
+  return res.status(400).json({ error: 'Invalid PDF request' });
 });
+
+if (require.main === module) {
+  const port = Number(process.env.PORT) || 8001;
+  app.listen(port, '0.0.0.0', () => console.log('PDF renderer listening on port ' + port));
+}
+module.exports = { app, authorized, safeFilename };

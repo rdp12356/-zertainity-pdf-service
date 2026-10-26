@@ -1,0 +1,27 @@
+name: PDF renderer security checks
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install locked dependencies
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: 'true'
+        run: npm ci
+      - name: Syntax check
+        run: node --check index.js
+      - name: Security tests
+        run: node --test test/security.test.js
+      - name: Dependency advisory gate
+        run: npm audit --audit-level=high --omit=dev
