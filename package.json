@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test test/security.test.js",
+    "check:security": "npm audit --audit-level=high --omit=dev"
   },
   "keywords": [],
   "author": "",
@@ -15,6 +16,6 @@
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "pdf-lib": "^1.17.1",
-    "puppeteer": "^25.5.0"
+    "puppeteer": "^25.16.0"
   }
 }
